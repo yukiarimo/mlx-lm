@@ -16,6 +16,7 @@ from .switch_layers import SwitchGLU
 
 @dataclass
 class ModelArgs(BaseModelArgs):
+    model_type: str = "gpt_oss"
     num_hidden_layers: int = 36
     num_local_experts: int = 128
     num_experts_per_tok: int = 4
@@ -29,6 +30,7 @@ class ModelArgs(BaseModelArgs):
     sliding_window: int = 128
     rope_theta: int = 150000
     rope_scaling: Any = None
+    layer_types: list = None
 
 
 # These operators emulate particular methods in torch that don't exist in MLX natively
@@ -47,9 +49,12 @@ def swiglu(x_linear, x_glu, alpha: float = 1.702, limit: float = 7.0):
     # Clamp the input values
     x_glu = mx.clip(x_glu, a_min=None, a_max=limit)
     x_linear = mx.clip(x_linear, a_min=-limit, a_max=limit)
-    glu_scaled = (alpha * x_glu.astype(mx.float32)).astype(mx.bfloat16)
+
+    # Preserve input dtype
+    input_dtype = x_glu.dtype
+    glu_scaled = (alpha * x_glu.astype(mx.float32)).astype(input_dtype)
     negative_glu = (-glu_scaled).astype(mx.float32)
-    sig = (1.0 / (1.0 + mx.exp(negative_glu))).astype(mx.bfloat16)
+    sig = (1.0 / (1.0 + mx.exp(negative_glu))).astype(input_dtype)
 
     out_glu = x_glu * sig
     # Note we add an extra bias of 1 to the linear layer
@@ -168,11 +173,11 @@ class AttentionBlock(nn.Module):
 
         return self._previous_mask[..., : min(L + offset, window_size + 1)]
 
-    def get_mask(self, x, cache, window_size, idx):
-        if idx % 2 == 1:
-            return self.get_causal_mask(x, cache)
-        else:
+    def get_mask(self, x, cache, window_size):
+        if window_size is not None:
             return self.get_sliding_window_mask(x, cache, window_size)
+        else:
+            return self.get_causal_mask(x, cache)
 
     def __call__(self, x: mx.array, mask: mx.array, cache=None) -> mx.array:
         B, L, _ = x.shape
@@ -225,18 +230,15 @@ class MLPBlock(nn.Module):
         self.router = nn.Linear(config.hidden_size, config.num_local_experts, bias=True)
 
     def __call__(self, x: mx.array) -> mx.array:
-        x = x.reshape(-1, self.hidden_size)
-
-        # N.B. As elsewhere, upcast is required in linear layers
-        g = self.router(x.astype(mx.float32)).astype(mx.bfloat16)
+        g = self.router(x)
         experts, indices = mlx_topk(g, k=self.num_experts_per_tok, axis=-1)
         expert_weights = mx.softmax(experts, axis=-1, precise=True)
 
         # Experts block
         x = self.experts(x, indices)
 
-        x = x * mx.expand_dims(expert_weights, axis=2)
-        return x.sum(axis=1)
+        x = x * mx.expand_dims(expert_weights, axis=-1)
+        return x.sum(axis=-2)
 
 
 class TransformerBlock(nn.Module):
@@ -267,6 +269,10 @@ class GptOssMoeModel(nn.Module):
         super().__init__()
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         self.norm = nn.RMSNorm(args.hidden_size, args.rms_norm_eps)
+        self.layer_types = args.layer_types or [
+            "sliding_attention",
+            "full_attention",
+        ] * (args.num_hidden_layers // 2)
         self.layers = [TransformerBlock(args) for _ in range(args.num_hidden_layers)]
         self.window_size = args.sliding_window
 
@@ -287,8 +293,10 @@ class GptOssMoeModel(nn.Module):
 
         if mask is None:
             masks = [
-                l.self_attn.get_mask(x, c, self.window_size, i)
-                for i, (l, c) in enumerate(zip(self.layers, cache))
+                l.self_attn.get_mask(
+                    x, c, self.window_size if lt == "sliding_attention" else None
+                )
+                for (l, c, lt) in zip(self.layers, cache, self.layer_types)
             ]
         else:
             masks = [mask] * len(self.layers)
@@ -328,10 +336,9 @@ def convert_moe_packed_tensors(blocks, scales):
     )
 
     *prefix_shape, G, B = blocks.shape
-    rows_total = math.prod(prefix_shape) * G
 
-    blocks = blocks.reshape(rows_total, B)
-    scales = scales.reshape(rows_total, 1)
+    blocks = blocks.reshape(-1, B)
+    scales = scales.reshape(-1, 1)
 
     idx_lo = blocks & 0x0F
     idx_hi = blocks >> 4
@@ -346,9 +353,7 @@ class Model(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
-        self.model_type = (
-            args.model_type if hasattr(args, "model_type") else "gpt_oss_moe"
-        )
+        self.model_type = args.model_type
         self.model = GptOssMoeModel(args)
         self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
@@ -405,9 +410,8 @@ class Model(nn.Module):
 
     def make_cache(self):
         caches = []
-        for i in range(self.args.num_hidden_layers):
-            # full attn on odd indices, swa on even
-            if i % 2 == 1:
+        for lt in self.model.layer_types:
+            if lt == "full_attention":
                 caches.append(KVCache())
             else:
                 caches.append(
