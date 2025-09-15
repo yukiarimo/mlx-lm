@@ -9,6 +9,7 @@ import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, MambaCache
+from .ssm import ssm_update
 
 
 @dataclass()
@@ -118,49 +119,29 @@ class NemotronHMamba2Mixer(nn.Module):
         B: mx.array,
         C: mx.array,
         dt: mx.array,
-        cache: Optional[MambaCache] = None,
+        state: Optional[mx.array],
     ) -> mx.array:
         batch_size, seq_len, _ = hidden_states.shape
-
-        dt = nn.softplus(dt + self.dt_bias)
-        dt = mx.clip(dt, self.time_step_limit[0], self.time_step_limit[1])
 
         hidden_states = hidden_states.reshape(
             batch_size, seq_len, self.num_heads, self.head_dim
         )
-
         B = B.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size)
-        B = mx.repeat(B, self.heads_per_group, axis=2)
         C = C.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size)
-        C = mx.repeat(C, self.heads_per_group, axis=2)
 
-        A = -mx.exp(self.A_log.astype(mx.float32)).astype(hidden_states.dtype)
+        y, state = ssm_update(
+            hidden_states,
+            self.A_log,
+            B,
+            C,
+            self.D,
+            dt,
+            self.dt_bias,
+            state,
+            self.time_step_limit,
+        )
 
-        if cache is not None and cache[1] is not None:
-            h = cache[1]
-        else:
-            h = mx.zeros(
-                (batch_size, self.num_heads, self.head_dim, self.ssm_state_size),
-                dtype=hidden_states.dtype,
-            )
-
-        outputs = []
-        for t in range(seq_len):
-            dt_t = dt[:, t, :]
-            dA = mx.exp(dt_t * A)[..., None, None]
-            dB = (dt_t[..., None] * B[:, t])[..., None, :]
-
-            h = dA * h + dB * hidden_states[:, t, :, :, None]
-            y_t = (h @ C[:, t, :, :, None]).squeeze(-1) + self.D[
-                :, None
-            ] * hidden_states[:, t]
-            outputs.append(y_t)
-
-        if cache is not None:
-            cache[1] = h
-
-        y = mx.stack(outputs, axis=1)
-        return y.reshape(batch_size, seq_len, self.intermediate_size)
+        return y.reshape(batch_size, seq_len, self.intermediate_size), state
 
     def __call__(
         self,
@@ -186,7 +167,10 @@ class NemotronHMamba2Mixer(nn.Module):
             ],
             axis=-1,
         )
-        y = self._ssm(hidden_states_ssm, B, C, dt, cache)
+        state = cache[1] if cache else None
+        y, state = self._ssm(hidden_states_ssm, B, C, dt, state)
+        if cache:
+            cache[1] = state
         y = self.norm(y, gate)
         return self.out_proj(y)
 
